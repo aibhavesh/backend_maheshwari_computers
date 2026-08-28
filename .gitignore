@@ -1,0 +1,6 @@
+# create .gitignore if you don't have one
+echo "venv/
+__pycache__/
+*.pyc
+.env
+.DS_Store" > .gitignore
