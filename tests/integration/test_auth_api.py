@@ -1,7 +1,10 @@
 """Auth-flow tests driven through the real ASGI app.
 
-Sign-in is Google-only. There is no registration, login or reset route, so
-every flow here starts from a verified Google identity.
+Two independent sign-in methods, tested side by side: Google (every flow
+below that starts from a verified Google identity) and manual email/password
+(``/auth/register`` and ``/auth/login``). Both are subject to the same
+organisation-domain admission gate, and both must produce a token pair that
+works identically against every protected route.
 """
 
 from __future__ import annotations
@@ -14,10 +17,12 @@ from tender_intel.api.dependencies.services import get_google_verifier
 from tender_intel.domain.enums.roles import UserRole
 from tender_intel.domain.exceptions import InvalidTokenError
 from tender_intel.domain.interfaces.providers import GoogleIdentity
+from tender_intel.infrastructure.repositories.user_repo import SqlAlchemyUserRepository
 from tests.integration.conftest import ORG_DOMAIN
 from tests.integration.helpers import bearer, get_user_by_email, seed_user
 
 ORG_EMAIL = f"asha@{ORG_DOMAIN}"
+OTHER_ORG_EMAIL = f"vikram@{ORG_DOMAIN}"
 
 
 class _StubVerifier:
@@ -54,17 +59,11 @@ async def _sign_in(client, id_token: str = "good"):
     return await client.post("/auth/google", json={"id_token": id_token})
 
 
-# --- The removed surface stays removed ---
+# --- There is still no password-reset flow ---
 @pytest.mark.parametrize(
-    ("method", "path"),
-    [
-        ("post", "/auth/register"),
-        ("post", "/auth/login"),
-        ("post", "/auth/forgot-password"),
-        ("post", "/auth/reset-password"),
-    ],
+    ("method", "path"), [("post", "/auth/forgot-password"), ("post", "/auth/reset-password")]
 )
-async def test_password_routes_do_not_exist(client, method, path):
+async def test_reset_routes_do_not_exist(client, method, path):
     resp = await getattr(client, method)(path, json={})
     assert resp.status_code == 404
 
@@ -176,6 +175,135 @@ async def test_mixed_case_google_email_normalises(client, app_db, google_identit
     stored = await get_user_by_email(app_db, ORG_EMAIL)
     assert stored is not None
     assert stored.email == ORG_EMAIL
+
+
+# --- Manual sign-up ---
+async def _register(client, **overrides):
+    body = {
+        "email": ORG_EMAIL,
+        "full_name": "Asha",
+        "password": "correct-horse-battery",
+        **overrides,
+    }
+    return await client.post("/auth/register", json=body)
+
+
+async def test_register_creates_an_employee_and_signs_in(client, app_db):
+    resp = await _register(client)
+    assert resp.status_code == 201
+    body = resp.json()
+    assert body["access_token"] and body["refresh_token"]
+
+    me = await client.get("/auth/me", headers={"Authorization": f"Bearer {body['access_token']}"})
+    assert me.status_code == 200
+    assert me.json()["email"] == ORG_EMAIL
+    assert me.json()["role"] == "EMPLOYEE"
+
+
+async def test_register_never_stores_the_plaintext_password(client, app_db):
+    await _register(client)
+    stored = await get_user_by_email(app_db, ORG_EMAIL)
+    assert stored is not None
+    assert stored.hashed_password is not None
+    assert stored.hashed_password != "correct-horse-battery"
+    assert "correct-horse-battery" not in stored.hashed_password
+
+
+async def test_register_rejects_non_org_email(client, app_db):
+    resp = await _register(client, email="outsider@gmail.com")
+    assert resp.status_code == 403
+    assert await get_user_by_email(app_db, "outsider@gmail.com") is None
+
+
+async def test_register_rejects_duplicate_email(client, app_db):
+    assert (await _register(client)).status_code == 201
+    dupe = await _register(client, full_name="Someone Else", password="a-different-password")
+    assert dupe.status_code == 409
+
+
+async def test_register_rejects_an_email_already_used_by_a_google_account(
+    client, app_db, google_identity
+):
+    assert (await client.post("/auth/google", json={"id_token": "good"})).status_code == 200
+    resp = await _register(client)
+    assert resp.status_code == 409
+
+
+async def test_register_rejects_short_password(client):
+    resp = await _register(client, password="short1")
+    assert resp.status_code == 422
+
+
+async def test_register_rejects_malformed_email(client):
+    resp = await _register(client, email="not-an-email")
+    assert resp.status_code == 422
+
+
+# --- Manual login ---
+async def test_login_with_correct_credentials(client, app_db):
+    await _register(client)
+    resp = await client.post(
+        "/auth/login", json={"email": ORG_EMAIL, "password": "correct-horse-battery"}
+    )
+    assert resp.status_code == 200
+    assert resp.json()["access_token"]
+
+
+async def test_login_rejects_wrong_password(client, app_db):
+    await _register(client)
+    resp = await client.post("/auth/login", json={"email": ORG_EMAIL, "password": "wrong-password"})
+    assert resp.status_code == 401
+
+
+async def test_login_rejects_unknown_email(client):
+    resp = await client.post(
+        "/auth/login", json={"email": OTHER_ORG_EMAIL, "password": "whatever-it-is"}
+    )
+    assert resp.status_code == 401
+
+
+async def test_login_rejects_a_google_only_account(client, app_db, google_identity):
+    """An account with no password (Google-only) must not be logged into manually."""
+    assert (await client.post("/auth/google", json={"id_token": "good"})).status_code == 200
+    resp = await client.post(
+        "/auth/login", json={"email": ORG_EMAIL, "password": "anything-at-all"}
+    )
+    assert resp.status_code == 401
+
+
+async def test_login_rejects_deactivated_account(client, app_db):
+    await _register(client)
+    stored = await get_user_by_email(app_db, ORG_EMAIL)
+    assert stored is not None
+    stored.is_active = False
+    factory = app_db.state.test_session_factory
+    async with factory() as session:
+        await SqlAlchemyUserRepository(session).update(stored)
+        await session.commit()
+
+    resp = await client.post(
+        "/auth/login", json={"email": ORG_EMAIL, "password": "correct-horse-battery"}
+    )
+    assert resp.status_code == 403
+
+
+async def test_registered_account_can_also_link_google_later(client, app_db):
+    """Manual and Google sign-in coexist: registering first does not block linking Google after."""
+    assert (await _register(client)).status_code == 201
+
+    _install(
+        app_db,
+        GoogleIdentity(
+            subject="google-sub-999", email=ORG_EMAIL, full_name="Asha", hosted_domain=ORG_DOMAIN
+        ),
+    )
+    resp = await client.post("/auth/google", json={"id_token": "good"})
+    assert resp.status_code == 200
+
+    stored = await get_user_by_email(app_db, ORG_EMAIL)
+    assert stored is not None
+    assert stored.google_sub == "google-sub-999"
+    assert stored.hashed_password is not None  # the password still works too
 
 
 # --- Refresh rotation & logout ---

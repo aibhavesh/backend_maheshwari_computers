@@ -57,6 +57,7 @@ def user_to_domain(m: UserModel) -> User:
         full_name=m.full_name,
         role=UserRole(m.role),
         google_sub=m.google_sub,
+        hashed_password=m.hashed_password,
         is_active=m.is_active,
         last_login_at=m.last_login_at,
         created_at=m.created_at,
@@ -69,12 +70,21 @@ def user_apply(m: UserModel, e: User) -> None:
     m.full_name = e.full_name
     m.role = e.role.value
     m.google_sub = e.google_sub
+    m.hashed_password = e.hashed_password
     m.is_active = e.is_active
     m.last_login_at = e.last_login_at
 
 
 def user_to_model(e: User) -> UserModel:
-    m = UserModel(id=e.id)
+    # created_at/updated_at are stamped from the domain entity, not left to the
+    # column's DB-side default — every other entity in this module does the same
+    # (see session_to_model, audit_to_model, review_to_model below). For User this
+    # also sidesteps a real portability gap: the initial migration's server_default
+    # is the Postgres-only ``now()``, which SQLite has no such function for, so a
+    # local SQLite dev database would fail on every very first INSERT that omits
+    # these columns. Explicit values make the column's default irrelevant on any
+    # dialect and match what the entity already carries.
+    m = UserModel(id=e.id, created_at=e.created_at, updated_at=e.updated_at)
     user_apply(m, e)
     return m
 

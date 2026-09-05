@@ -1,7 +1,5 @@
-"""Phase 2 security-primitive tests: JWT lifecycle and the RBAC dependencies.
-
-Password hashing is gone with manual registration — sign-in is Google-only and
-the platform stores no credentials.
+"""Phase 2 security-primitive tests: JWT lifecycle, password hashing, and the
+RBAC dependencies.
 """
 
 from __future__ import annotations
@@ -12,11 +10,41 @@ from tender_intel.core.config import Environment, Settings
 from tender_intel.domain.entities import User
 from tender_intel.domain.enums.roles import UserRole
 from tender_intel.domain.exceptions import InvalidTokenError, PermissionDeniedError
+from tender_intel.infrastructure.security.passwords import hash_password, verify_password
 from tender_intel.infrastructure.security.tokens import (
     TokenService,
     TokenType,
     hash_refresh_token,
 )
+
+
+# --- Password hashing ---
+def test_password_hash_roundtrips():
+    hashed = hash_password("correct-horse-battery")
+    assert verify_password("correct-horse-battery", hashed) is True
+
+
+def test_password_hash_rejects_wrong_password():
+    hashed = hash_password("correct-horse-battery")
+    assert verify_password("wrong-password", hashed) is False
+
+
+def test_password_hash_never_stores_the_plaintext():
+    hashed = hash_password("correct-horse-battery")
+    assert "correct-horse-battery" not in hashed
+
+
+def test_password_hash_uses_a_fresh_salt_each_time():
+    first = hash_password("correct-horse-battery")
+    second = hash_password("correct-horse-battery")
+    assert first != second  # different salts -> different stored strings
+    assert verify_password("correct-horse-battery", first) is True
+    assert verify_password("correct-horse-battery", second) is True
+
+
+def test_verify_password_fails_closed_on_garbage_input():
+    assert verify_password("anything", "not-a-hash") is False
+    assert verify_password("anything", "") is False
 
 
 def _settings(**kw) -> Settings:

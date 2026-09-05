@@ -17,14 +17,19 @@ def _now() -> datetime:
 class User:
     """A platform account.
 
-    Sign-in is Google-only — there is no password on this entity. ``email`` is
-    always stored normalised (trimmed, lowercased) by the admission gate.
+    Sign-in supports two independent methods: Google (``google_sub`` set) and
+    email/password (``hashed_password`` set). Neither is required by the
+    other — an account may hold one, the other, or both once linked — but the
+    admission gate (organisation domain, or an individually excepted address)
+    applies to every account-creation path alike. ``email`` is always stored
+    normalised (trimmed, lowercased) by that gate.
     """
 
     email: str
     full_name: str
     role: UserRole = UserRole.EMPLOYEE
     google_sub: str | None = None  # Google subject identifier, if linked
+    hashed_password: str | None = None  # PBKDF2 hash, if manual sign-in is set up
     is_active: bool = True
     last_login_at: datetime | None = None
     id: UUID = field(default_factory=uuid4)

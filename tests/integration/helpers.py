@@ -1,10 +1,13 @@
 """Shared helpers for API integration tests.
 
-Sign-in is Google-only, so there is no HTTP route that creates an account from
-a password. Tests that need an authenticated caller seed the User row directly
-and mint an access token for it. That deliberately bypasses the admission gate
-— the gate has its own dedicated tests, and every other test would otherwise
-have to stand up a Google stub to get a bearer token.
+Sign-in supports Google and manual email/password alike, both over HTTP
+(``/auth/google``, ``/auth/register``); the auth-flow tests exercise those
+routes directly. Most other tests just need an authenticated caller and don't
+care which method it used, so this module seeds the User row directly and
+mints an access token for it instead — that deliberately bypasses the
+admission gate (the gate has its own dedicated tests in test_auth_api.py), and
+every other test would otherwise have to stand up a Google stub or register an
+account just to get a bearer token.
 """
 
 from __future__ import annotations
@@ -28,13 +31,25 @@ async def seed_user(
     full_name: str = "Test",
     role: UserRole = UserRole.EMPLOYEE,
     is_active: bool = True,
+    hashed_password: str | None = None,
 ) -> User:
-    """Insert a user directly, bypassing the Google sign-in flow."""
+    """Insert a user directly, bypassing both the Google and manual sign-in flows.
+
+    ``hashed_password`` is a pre-hashed value, not a plaintext password — pass
+    ``infrastructure.security.passwords.hash_password("...")`` when a test
+    needs a seeded account that can also log in manually.
+    """
     factory = app.state.test_session_factory
     async with factory() as session:
         repo = SqlAlchemyUserRepository(session)
         created = await repo.add(
-            User(email=email, full_name=full_name, role=role, is_active=is_active)
+            User(
+                email=email,
+                full_name=full_name,
+                role=role,
+                is_active=is_active,
+                hashed_password=hashed_password,
+            )
         )
         await session.commit()
         return created

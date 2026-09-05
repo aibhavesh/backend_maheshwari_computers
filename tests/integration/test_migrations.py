@@ -29,7 +29,8 @@ _INITIAL = "df21fab595ca"  # base schema, before the role collapse
 _COLLAPSE_ROLES = "a1c4e07b91d2"
 _BEFORE_BOOTSTRAP = "c2d8b6f4173a"  # role_assignments exists, nothing seeded
 _BEFORE_SPLIT = "d4a1e9c5b872"  # tender_reviews still requires a verdict
-_SPLIT = "e7c3a5d18f92"
+_SPLIT = "e7c3a5d18f92"  # hashed_password still absent
+_RESTORE_PASSWORD = "7690fc277a01"
 
 
 def _alembic_config(connection: sa.Connection) -> Config:
@@ -61,8 +62,9 @@ def _insert_user(
 ) -> uuid.UUID:
     """Insert a user row.
 
-    ``with_password`` must be False at any revision at or after
-    ``b7f39d5a2e60``, which drops the column.
+    ``with_password`` must be False at any revision from ``b7f39d5a2e60``
+    (which drops the column) up to but not including ``7690fc277a01`` (which
+    restores it).
     """
     user_id = uuid.uuid4()
     now = datetime.now(UTC).isoformat(sep=" ")
@@ -124,11 +126,13 @@ def test_downgrade_of_the_collapse_lands_on_the_lower_role(engine: sa.Engine):
 
 
 # --- Schema shape at head --- #
-def test_password_column_is_gone_and_role_assignments_exist(engine: sa.Engine):
+def test_password_column_is_present_and_nullable_and_role_assignments_exist(engine: sa.Engine):
     _upgrade(engine, "head")
 
     inspector = sa.inspect(engine)
-    assert "hashed_password" not in {c["name"] for c in inspector.get_columns("users")}
+    columns = {c["name"]: c for c in inspector.get_columns("users")}
+    # Nullable: a Google-only account never gets one, and none is required.
+    assert columns["hashed_password"]["nullable"] is True
     assert "role_assignments" in inspector.get_table_names()
 
     columns = {c["name"]: c for c in inspector.get_columns("role_assignments")}
@@ -143,6 +147,39 @@ def test_password_column_is_gone_and_role_assignments_exist(engine: sa.Engine):
     }
     # The bootstrap row has no human assigner, so this must be nullable.
     assert columns["assigned_by"]["nullable"] is True
+
+
+# --- Restoring password authentication --- #
+def test_password_column_absent_before_the_restore(engine: sa.Engine):
+    _upgrade(engine, _SPLIT)
+    inspector = sa.inspect(engine)
+    assert "hashed_password" not in {c["name"] for c in inspector.get_columns("users")}
+
+
+def test_password_column_added_nullable_and_existing_rows_survive(engine: sa.Engine):
+    _upgrade(engine, _SPLIT)
+    with engine.begin() as connection:
+        _insert_user(connection, "google-only@x.com", "EMPLOYEE", with_password=False)
+
+    _upgrade(engine, _RESTORE_PASSWORD)
+
+    inspector = sa.inspect(engine)
+    columns = {c["name"]: c for c in inspector.get_columns("users")}
+    assert columns["hashed_password"]["nullable"] is True
+    with engine.connect() as connection:
+        row = connection.execute(
+            sa.text("SELECT hashed_password FROM users WHERE email = :email"),
+            {"email": "google-only@x.com"},
+        ).first()
+    assert row is not None
+    assert row[0] is None
+
+
+def test_downgrade_of_the_restore_drops_the_column_again(engine: sa.Engine):
+    _upgrade(engine, _RESTORE_PASSWORD)
+    _downgrade(engine, _SPLIT)
+    inspector = sa.inspect(engine)
+    assert "hashed_password" not in {c["name"] for c in inspector.get_columns("users")}
 
 
 # --- The correction/verdict split --- #

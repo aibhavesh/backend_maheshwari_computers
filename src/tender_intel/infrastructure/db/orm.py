@@ -45,6 +45,8 @@ class UserModel(TimestampMixin, Base):
     full_name: Mapped[str] = mapped_column(String(255))
     role: Mapped[str] = mapped_column(String(32))
     google_sub: Mapped[str | None] = mapped_column(String(255), unique=True, index=True)
+    # PBKDF2 hash for manual (email/password) sign-in; NULL for a Google-only account.
+    hashed_password: Mapped[str | None] = mapped_column(String(255))
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     last_login_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
 

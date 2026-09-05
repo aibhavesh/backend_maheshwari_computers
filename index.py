@@ -1,9 +1,8 @@
 """Vercel entrypoint for the Tender Intelligence FastAPI application.
 
-Vercel serves files under ``api/`` beneath the ``/api`` URL prefix. The
-existing application was designed with routes such as ``/health`` and
-``/auth/...``. This adapter removes the Vercel ``/api`` prefix before
-forwarding requests, so existing backend routes remain unchanged.
+The standalone backend repository is the Vercel project root. Export the
+FastAPI instance for framework detection, and accept both native routes
+(``/health``) and the legacy ``/api`` prefix (``/api/health``).
 """
 
 from __future__ import annotations
@@ -12,8 +11,8 @@ import os
 import sys
 from typing import Any
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-BACKEND_SRC = os.path.join(ROOT, "backend", "src")
+ROOT = os.path.dirname(os.path.abspath(__file__))
+BACKEND_SRC = os.path.join(ROOT, "src")
 if BACKEND_SRC not in sys.path:
     sys.path.insert(0, BACKEND_SRC)
 
@@ -28,8 +27,8 @@ from tender_intel.api.app import app as _application  # noqa: E402
 class StripVercelApiPrefix:
     """Forward /api/* requests to the existing FastAPI routes as /*."""
 
-    def __init__(self, application: Any) -> None:
-        self.application = application
+    def __init__(self, app: Any) -> None:
+        self.application = app
 
     async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> Any:
         if scope["type"] in {"http", "websocket"}:
@@ -49,4 +48,5 @@ class StripVercelApiPrefix:
         return await self.application(scope, receive, send)
 
 
-app = StripVercelApiPrefix(_application)
+_application.add_middleware(StripVercelApiPrefix)
+app = _application

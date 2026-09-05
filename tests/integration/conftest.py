@@ -81,8 +81,9 @@ async def app_db() -> AsyncIterator[FastAPI]:
     app.dependency_overrides[get_embedding_provider] = lambda: embeddings
     app.dependency_overrides[get_vector_store] = lambda: vector_store
     # Expose the factory and settings so tests can seed accounts and mint
-    # tokens directly — with registration gone there is no HTTP path that
-    # creates a user without a Google token.
+    # tokens directly, bypassing both the admission gate and password
+    # hashing — most tests just need an authenticated caller and don't care
+    # which sign-in method it used.
     app.state.test_session_factory = factory
     app.state.test_settings = settings
     yield app

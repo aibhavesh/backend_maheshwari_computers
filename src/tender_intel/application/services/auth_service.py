@@ -1,20 +1,25 @@
 """Authentication & account lifecycle use cases (FR-501..FR-508).
 
-Sign-in is Google-only. There is no password on this platform: no manual
-registration, no credential login, no reset flow. An account comes into
-existence exactly once, through :meth:`AuthService.google_login`, and only
-after passing two gates in order:
+Two independent sign-in methods share one architecture: Google (a verified ID
+token) and manual email/password. Either one may create an account, and both
+are subject to the same two gates, in order:
 
 1. **Admission** — :func:`assert_org_email` rejects any address outside the
    configured organisation domains, before any row is written. A short list of
    individually named addresses may be excepted for people who need access
-   without being on one.
+   without being on one. This applies to :meth:`google_login` *and*
+   :meth:`register` alike — manual sign-up does not bypass it.
 2. **Elevation** — a RoleAssignment row for that normalised address decides the
    role the account is born with; without one the account is EMPLOYEE.
 
 Elevation is evaluated at creation only. A returning user's role is read from
 their User row and never re-derived, so a later assignment cannot silently
 change a live account.
+
+Manual sign-up never creates a second account for an address that already has
+one, Google or password (see :meth:`register`). Google remains entirely
+optional: unconfigured or unused, :meth:`register`/:meth:`login` work on their
+own, and vice versa for an installation with no manual accounts.
 
 Emits an audit-log entry on every state-changing action (cross-cutting
 requirement).
@@ -31,6 +36,8 @@ from tender_intel.core.config import Settings
 from tender_intel.domain.entities import AuditLog, User, UserSession
 from tender_intel.domain.enums.roles import UserRole
 from tender_intel.domain.exceptions import (
+    AuthenticationError,
+    DuplicateEntityError,
     EntityNotFoundError,
     ForbiddenDomainError,
     InactiveUserError,
@@ -48,6 +55,7 @@ from tender_intel.domain.services.email_domain import (
     is_excepted,
     normalize_email,
 )
+from tender_intel.infrastructure.security.passwords import hash_password, verify_password
 from tender_intel.infrastructure.security.tokens import TokenService, TokenType, hash_refresh_token
 
 
@@ -74,13 +82,13 @@ class AuthService:
         self._access_ttl_seconds = settings.access_token_ttl_minutes * 60
 
     # ------------------------------------------------------------------ #
-    # Google sign-in — the only way an account is created
+    # Google sign-in — optional; not the only way an account is created
     # ------------------------------------------------------------------ #
     async def google_login(
         self, *, id_token: str, ip: str | None, user_agent: str | None
     ) -> TokenPair:
         identity = await self._google.verify(id_token)
-        normalized = self._admit(identity)
+        normalized = self._admit_google(identity)
 
         user = await self._users.get_by_google_sub(identity.subject)
         if user is None:
@@ -89,7 +97,9 @@ class AuthService:
                 existing.google_sub = identity.subject  # link Google to the account
                 user = await self._users.update(existing)
             else:
-                user = await self._create_account(normalized, identity)
+                user = await self._create_account(
+                    normalized, identity.full_name, google_sub=identity.subject
+                )
 
         self._require_active(user)
         user.last_login_at = datetime.now(UTC)
@@ -98,7 +108,7 @@ class AuthService:
         await self._audit(user.id, "user.google_login", "User", user.id)
         return pair
 
-    def _admit(self, identity: GoogleIdentity) -> str:
+    def _admit_google(self, identity: GoogleIdentity) -> str:
         """Apply the admission gate, returning the normalised address.
 
         When Google asserts a hosted domain we check that too: ``hd`` is a
@@ -124,16 +134,88 @@ class AuthService:
             )
         return assert_org_email(identity.email, self._allowed_domains)
 
-    async def _create_account(self, normalized: str, identity: GoogleIdentity) -> User:
+    # ------------------------------------------------------------------ #
+    # Manual sign-in — optional, and equally subject to the admission gate
+    # ------------------------------------------------------------------ #
+    async def register(
+        self,
+        *,
+        email: str,
+        password: str,
+        full_name: str,
+        ip: str | None,
+        user_agent: str | None,
+    ) -> TokenPair:
+        """Create an account with an email/password credential and sign it in.
+
+        Subject to the same admission gate as Google sign-in
+        (:func:`assert_org_email`), so manual sign-up cannot admit an address
+        Google sign-in would refuse. Refuses a duplicate email outright rather
+        than attaching a password to an existing (possibly Google-only)
+        account — linking a credential onto someone else's account is not a
+        decision this endpoint should make silently.
+        """
+        normalized = assert_org_email(email, self._allowed_domains, self._allowed_exceptions)
+        if await self._users.get_by_email(normalized) is not None:
+            raise DuplicateEntityError("User", "email", normalized)
+
+        user = await self._create_account(
+            normalized, full_name.strip(), hashed_password=hash_password(password)
+        )
+        user.last_login_at = datetime.now(UTC)
+        user = await self._users.update(user)
+        pair = await self._issue_pair(user, ip, user_agent)
+        await self._audit(user.id, "user.register", "User", user.id)
+        return pair
+
+    async def login(
+        self, *, email: str, password: str, ip: str | None, user_agent: str | None
+    ) -> TokenPair:
+        """Verify an email/password credential and sign the account in.
+
+        One generic failure (:class:`AuthenticationError`) covers "no such
+        user", "wrong password" and "this account has no password (it is
+        Google-only)" alike — distinguishing them to the caller would let an
+        attacker enumerate registered addresses or discover which sign-in
+        method an account uses.
+        """
+        normalized = normalize_email(email)
+        user = await self._users.get_by_email(normalized)
+        if (
+            user is None
+            or user.hashed_password is None
+            or not verify_password(password, user.hashed_password)
+        ):
+            raise AuthenticationError("invalid email or password")
+
+        self._require_active(user)
+        user.last_login_at = datetime.now(UTC)
+        await self._users.update(user)
+        pair = await self._issue_pair(user, ip, user_agent)
+        await self._audit(user.id, "user.login", "User", user.id)
+        return pair
+
+    # ------------------------------------------------------------------ #
+    # Account creation — shared by every sign-in method
+    # ------------------------------------------------------------------ #
+    async def _create_account(
+        self,
+        normalized: str,
+        full_name: str,
+        *,
+        google_sub: str | None = None,
+        hashed_password: str | None = None,
+    ) -> User:
         """Create the account, honouring a pre-provisioned elevation if one exists."""
         assignment = await self._assignments.get_by_email(normalized)
         role = assignment.role if assignment is not None else UserRole.EMPLOYEE
         created = await self._users.add(
             User(
                 email=normalized,
-                full_name=identity.full_name,
+                full_name=full_name,
                 role=role,
-                google_sub=identity.subject,
+                google_sub=google_sub,
+                hashed_password=hashed_password,
             )
         )
         if assignment is not None:
